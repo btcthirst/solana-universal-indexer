@@ -13,11 +13,11 @@ export interface InstructionRecord {
 }
 
 export interface AccountRecord {
-    accountName: string;
+    accountName: string;        // IDL account type name, e.g. "Offer"
     pubkey: string;
     slot: number;
     lamports: number | null;
-    data: Record<string, unknown>;
+    data: Record<string, unknown>;   // decoded fields from BorshAccountsCoder
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ function toSnake(name: string): string {
         .replace(/^_/, "");
 }
 
-// Recursive serialization — BigInt → string, others via JSON for JSONB fields
+// Recursive serialization — BigInt → string, others passthrough for JSONB fields
 function safeSerialize(value: unknown): unknown {
     if (typeof value === "bigint") return value.toString();
     if (value === null || value === undefined) return value;
@@ -55,11 +55,9 @@ export async function writeInstruction(
 ): Promise<void> {
     const { instruction, signature, slot, blockTime, success } = record;
 
-    // System columns
     const baseColumns = ["signature", "slot", "block_time", "success", "caller"];
     const baseValues: unknown[] = [signature, slot, blockTime, success, instruction.accounts[0] ?? null];
 
-    // Instruction arguments → arg_ prefix, snake_case
     const argColumns = Object.keys(instruction.args).map(
         (k) => `arg_${toSnake(k)}`
     );
@@ -69,19 +67,22 @@ export async function writeInstruction(
     const values = [...baseValues, ...argValues];
 
     const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
-    const columnList = columns.join(", ");
 
     const sql = `
-    INSERT INTO ${tableName} (${columnList})
-    VALUES (${placeholders})
-    ON CONFLICT (signature) DO NOTHING
-  `;
+        INSERT INTO ${tableName} (${columns.join(", ")})
+        VALUES (${placeholders})
+        ON CONFLICT (signature) DO NOTHING
+    `;
 
     await db.query(sql, values);
     logger.debug({ tableName, signature }, "Instruction written");
 }
 
 // ─── writeAccount ─────────────────────────────────────────────────────────────
+// Upserts one decoded account into its acc_<type> table.
+// The UPSERT condition "WHERE table.slot <= EXCLUDED.slot" means:
+//   overwrite only when the incoming data is from an equal-or-newer slot,
+//   i.e. keep the latest known state and never regress to older data.
 
 export async function writeAccount(
     db: DbClient,
@@ -94,6 +95,8 @@ export async function writeAccount(
     const baseColumns = ["pubkey", "slot", "lamports"];
     const baseValues: unknown[] = [pubkey, slot, lamports];
 
+    // data keys come from BorshAccountsCoder — already snake_case for IDLs
+    // that use snake_case field names. toSnake() is safe to call twice.
     const dataColumns = Object.keys(data).map((k) => toSnake(k));
     const dataValues = Object.values(data).map(safeSerialize);
 
@@ -101,25 +104,30 @@ export async function writeAccount(
     const values = [...baseValues, ...dataValues];
 
     const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
-    const columnList = columns.join(", ");
 
-    // UPSERT — update if the slot is newer
-    const updateSet = ["slot = EXCLUDED.slot", "lamports = EXCLUDED.lamports",
+    // Build the SET list for every column except pubkey (the PK).
+    const updateSet = [
+        "slot = EXCLUDED.slot",
+        "lamports = EXCLUDED.lamports",
         ...dataColumns.map((c) => `${c} = EXCLUDED.${c}`),
     ].join(", ");
 
+    // Only overwrite when the new data is from the same or a later slot.
+    // This prevents a stale sweep from reverting a more recent realtime update.
     const sql = `
-    INSERT INTO ${tableName} (${columnList})
-    VALUES (${placeholders})
-    ON CONFLICT (pubkey) DO UPDATE SET ${updateSet}
-    WHERE ${tableName}.slot <= EXCLUDED.slot
-  `;
+        INSERT INTO ${tableName} (${columns.join(", ")})
+        VALUES (${placeholders})
+        ON CONFLICT (pubkey) DO UPDATE
+            SET ${updateSet}
+            WHERE ${tableName}.slot <= EXCLUDED.slot
+    `;
 
     await db.query(sql, values);
     logger.debug({ tableName, pubkey }, "Account written");
 }
 
 // ─── writeBatch ───────────────────────────────────────────────────────────────
+// Writes a mixed batch of instruction and account records inside one transaction.
 
 export async function writeBatch(
     db: DbClient,
@@ -128,11 +136,15 @@ export async function writeBatch(
     logger: Logger
 ): Promise<void> {
     await db.transaction(async (client) => {
+        // ── Instructions ──────────────────────────────────────────────────────
         for (const { tableName, record } of instructions) {
             const { instruction, signature, slot, blockTime, success } = record;
 
             const baseColumns = ["signature", "slot", "block_time", "success", "caller"];
-            const baseValues: unknown[] = [signature, slot, blockTime, success, instruction.accounts[0] ?? null];
+            const baseValues: unknown[] = [
+                signature, slot, blockTime, success,
+                instruction.accounts[0] ?? null,
+            ];
 
             const argColumns = Object.keys(instruction.args).map(
                 (k) => `arg_${toSnake(k)}`
@@ -145,12 +157,13 @@ export async function writeBatch(
 
             await client.query(
                 `INSERT INTO ${tableName} (${columns.join(", ")})
-         VALUES (${placeholders})
-         ON CONFLICT (signature) DO NOTHING`,
+                 VALUES (${placeholders})
+                 ON CONFLICT (signature) DO NOTHING`,
                 values
             );
         }
 
+        // ── Accounts ──────────────────────────────────────────────────────────
         for (const { tableName, record } of accounts) {
             const { pubkey, slot, lamports, data } = record;
 
@@ -172,9 +185,10 @@ export async function writeBatch(
 
             await client.query(
                 `INSERT INTO ${tableName} (${columns.join(", ")})
-         VALUES (${placeholders})
-         ON CONFLICT (pubkey) DO UPDATE SET ${updateSet}
-         WHERE ${tableName}.slot <= EXCLUDED.slot`,
+                 VALUES (${placeholders})
+                 ON CONFLICT (pubkey) DO UPDATE
+                     SET ${updateSet}
+                     WHERE ${tableName}.slot <= EXCLUDED.slot`,
                 values
             );
         }

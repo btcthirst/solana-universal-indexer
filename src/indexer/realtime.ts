@@ -5,13 +5,14 @@ import type { Decoder } from "./decoder";
 import type { DbClient } from "../db/client";
 import type { ParsedIdl } from "../idl/types";
 import { writeBatch } from "../db/writer";
-import type { InstructionRecord, AccountRecord } from "../db/writer";
+import type { InstructionRecord } from "../db/writer";
+import { sweepAccounts, sweepSingleAccount } from "./account-sweeper";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const SIGNATURES_PER_PAGE = 1000;
 const TX_BATCH_SIZE = 10;
-const STATE_SAVE_EVERY = 10;   // save cursor every N transactions
+const STATE_SAVE_EVERY = 10;
 const WS_RECONNECT_BASE_MS = 1_000;
 const WS_RECONNECT_MAX_MS = 30_000;
 
@@ -34,7 +35,7 @@ async function loadLastSignature(
 ): Promise<string | null> {
     const { rows } = await db.query<{ last_signature: string | null }>(
         `SELECT last_signature FROM _indexer_state
-     WHERE key = 'realtime' AND program_id = $1 AND network = $2`,
+         WHERE key = 'realtime' AND program_id = $1 AND network = $2`,
         [programId, network]
     );
     return rows[0]?.last_signature ?? null;
@@ -49,21 +50,21 @@ async function saveLastSignature(
 ): Promise<void> {
     await db.query(
         `INSERT INTO _indexer_state (key, program_id, network, last_signature, last_slot, updated_at)
-     VALUES ('realtime', $1, $2, $3, $4, NOW())
-     ON CONFLICT (key, program_id, network) DO UPDATE SET
-       last_signature = EXCLUDED.last_signature,
-       last_slot      = EXCLUDED.last_slot,
-       updated_at     = NOW()`,
+         VALUES ('realtime', $1, $2, $3, $4, NOW())
+         ON CONFLICT (key, program_id, network) DO UPDATE SET
+             last_signature = EXCLUDED.last_signature,
+             last_slot      = EXCLUDED.last_slot,
+             updated_at     = NOW()`,
         [programId, network, signature, slot]
     );
 }
 
-// ─── Fetch missed signatures (backfill) ───────────────────────────────────────
+// ─── Fetch missed signatures ──────────────────────────────────────────────────
 
 async function fetchMissedSignatures(
     rpc: RpcClient,
     programId: PublicKey,
-    until: string,   // the last known signature — stop here
+    until: string,
     logger: Logger
 ): Promise<string[]> {
     const signatures: string[] = [];
@@ -79,27 +80,30 @@ async function fetchMissedSignatures(
         });
 
         if (page.length === 0) break;
-
-        for (const sig of page) {
-            signatures.push(sig.signature);
-        }
-
+        for (const sig of page) signatures.push(sig.signature);
         if (page.length < SIGNATURES_PER_PAGE) break;
         before = page[page.length - 1]?.signature;
     }
 
-    // RPC returns from newest to oldest — reverse for chronological processing
-    return signatures.reverse();
+    return signatures.reverse();  // oldest first
 }
 
 // ─── Process one transaction ──────────────────────────────────────────────────
+
+interface ProcessedTx {
+    slot: number;
+    ixRecords: { tableName: string; record: InstructionRecord }[];
+    // Writable pubkeys from decoded instructions — candidates for acc_ refresh.
+    // accounts[0] is usually the signer; everything after may be program PDAs.
+    writableAccountPubkeys: string[];
+}
 
 async function processTx(
     signature: string,
     rpc: RpcClient,
     decoder: Decoder,
     logger: Logger
-): Promise<{ slot: number; ixRecords: { tableName: string; record: InstructionRecord }[] } | null> {
+): Promise<ProcessedTx | null> {
     const tx = await rpc.getTransaction(signature);
     if (!tx) {
         logger.warn({ signature }, "Transaction not found — skipping");
@@ -118,7 +122,23 @@ async function processTx(
         record: { instruction: ix, signature, slot, blockTime, success },
     }));
 
-    return { slot, ixRecords };
+    // Collect non-signer account pubkeys from successful transactions.
+    // These are the program-owned PDAs most likely to have changed state.
+    const writableAccountPubkeys: string[] = [];
+    if (success) {
+        const seen = new Set<string>();
+        for (const ix of instructions) {
+            for (let i = 1; i < ix.accounts.length; i++) {
+                const pk = ix.accounts[i];
+                if (pk && !seen.has(pk)) {
+                    seen.add(pk);
+                    writableAccountPubkeys.push(pk);
+                }
+            }
+        }
+    }
+
+    return { slot, ixRecords, writableAccountPubkeys };
 }
 
 // ─── Backfill ─────────────────────────────────────────────────────────────────
@@ -153,12 +173,11 @@ async function runBackfill(
         );
 
         const ixRecords: { tableName: string; record: InstructionRecord }[] = [];
-        const accRecords: { tableName: string; record: AccountRecord }[] = [];
 
         for (let j = 0; j < results.length; j++) {
             const result = results[j];
             if (result?.status === "rejected") {
-                logger.warn({ signature: batch[j], err: result.reason }, "Backfill tx failed — skipping");
+                logger.warn({ signature: batch[j], err: result.reason }, "Backfill tx failed");
                 continue;
             }
             if (!result?.value) continue;
@@ -173,10 +192,9 @@ async function runBackfill(
         }
 
         if (ixRecords.length > 0) {
-            await writeBatch(db, ixRecords, accRecords, logger);
+            await writeBatch(db, ixRecords, [], logger);
         }
 
-        // Save cursor every STATE_SAVE_EVERY transactions
         if (latestSignature && processed % STATE_SAVE_EVERY === 0) {
             await saveLastSignature(db, programId.toBase58(), network, latestSignature, latestSlot);
             logger.debug({ processed, latestSignature }, "Backfill cursor saved");
@@ -201,18 +219,13 @@ function subscribeWithReconnect(
 
     async function subscribe(): Promise<void> {
         if (stopped) return;
-
         try {
             subId = connection.onLogs(
                 programId,
-                (logs) => {
-                    if (logs.err) return;   // skip failed tx
-                    onSignature(logs.signature);
-                },
+                (logs) => { if (!logs.err) onSignature(logs.signature); },
                 "confirmed"
             );
-
-            attempt = 0;  // successful connection — reset the counter
+            attempt = 0;
             logger.info({ programId: programId.toBase58() }, "WebSocket subscribed");
         } catch (err) {
             attempt++;
@@ -223,8 +236,6 @@ function subscribeWithReconnect(
         }
     }
 
-    // Catch WebSocket errors using accountChange as a sentinel
-    // @solana/web3.js does not expose onError directly — watchdog via ping
     const watchdog = setInterval(async () => {
         if (stopped || subId === null) return;
         try {
@@ -244,7 +255,6 @@ function subscribeWithReconnect(
 
     subscribe();
 
-    // Return a function to stop the subscription
     return () => {
         stopped = true;
         clearInterval(watchdog);
@@ -266,15 +276,16 @@ export async function runRealtime(
     opts: RealtimeOptions,
     rpc: RpcClient,
     decoder: Decoder,
-    _idl: ParsedIdl,
+    idl: ParsedIdl,
     db: DbClient,
     logger: Logger
 ): Promise<void> {
     const log = logger.child({ module: "realtime-indexer" });
     const { programId, network, connection } = opts;
     const programIdStr = programId.toBase58();
+    const hasAccountTypes = idl.accounts.length > 0;
 
-    // ─── Cold start: backfill ─────────────────────────────────────────────────
+    // ─── Cold start: backfill missed transactions ─────────────────────────────
 
     const lastSignature = await loadLastSignature(db, programIdStr, network);
 
@@ -290,7 +301,17 @@ export async function runRealtime(
         log.info("Cold start: no previous state — starting fresh");
     }
 
-    // ─── Realtime subscription ────────────────────────────────────────────────
+    // ─── Initial account sweep ────────────────────────────────────────────────
+    // Populates acc_ tables with a full snapshot of current on-chain state
+    // before entering the realtime loop. Individual accounts are then refreshed
+    // per-transaction via sweepSingleAccount() as they change.
+
+    if (hasAccountTypes) {
+        log.info("Running initial account sweep...");
+        await sweepAccounts(programId, rpc, decoder, idl, db, log);
+    }
+
+    // ─── Realtime loop ────────────────────────────────────────────────────────
 
     log.info("Switching to realtime mode...");
 
@@ -306,7 +327,19 @@ export async function runRealtime(
                 const result = await processTx(signature, rpc, decoder, log);
                 if (!result) return;
 
+                // Write instructions first
                 await writeBatch(db, result.ixRecords, [], log);
+
+                // Then refresh every account that may have changed.
+                // sweepSingleAccount uses getAccountInfo (one call per account)
+                // which is much cheaper than a full getProgramAccounts sweep.
+                if (hasAccountTypes && result.writableAccountPubkeys.length > 0) {
+                    await Promise.allSettled(
+                        result.writableAccountPubkeys.map((pk) =>
+                            sweepSingleAccount(pk, rpc, decoder, idl, db, result.slot, log)
+                        )
+                    );
+                }
 
                 processedSinceLastSave++;
                 if (result.slot > latestSlot) {
@@ -314,10 +347,9 @@ export async function runRealtime(
                     latestSignature = signature;
                 }
 
-                // Save cursor every STATE_SAVE_EVERY transactions
                 if (processedSinceLastSave >= STATE_SAVE_EVERY && latestSignature) {
                     await saveLastSignature(db, programIdStr, network, latestSignature, latestSlot);
-                    log.debug({ latestSignature, latestSlot }, "Realtime cursor saved");
+                    log.debug({ latestSignature, latestSlot }, "Cursor saved");
                     processedSinceLastSave = 0;
                 }
             } catch (err) {
@@ -327,19 +359,8 @@ export async function runRealtime(
         log
     );
 
-    // Graceful shutdown
-    process.on("SIGINT", () => {
-        log.info("Received SIGINT — shutting down realtime indexer");
-        stop();
-        process.exit(0);
-    });
+    process.on("SIGINT", () => { stop(); process.exit(0); });
+    process.on("SIGTERM", () => { stop(); process.exit(0); });
 
-    process.on("SIGTERM", () => {
-        log.info("Received SIGTERM — shutting down realtime indexer");
-        stop();
-        process.exit(0);
-    });
-
-    // Keep the process alive
     await new Promise<void>(() => { });
 }
