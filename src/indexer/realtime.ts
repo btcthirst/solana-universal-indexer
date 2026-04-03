@@ -23,16 +23,12 @@ function toSnake(name: string): string {
 }
 
 function sleep(ms: number): Promise<void> {
-    return new Promise((r) => setTimeout(r, ms));
+    return new Promise(r => setTimeout(r, ms));
 }
 
 // ─── State persistence ────────────────────────────────────────────────────────
 
-async function loadLastSignature(
-    db: DbClient,
-    programId: string,
-    network: string
-): Promise<string | null> {
+async function loadLastSignature(db: DbClient, programId: string, network: string): Promise<string | null> {
     const { rows } = await db.query<{ last_signature: string | null }>(
         `SELECT last_signature FROM _indexer_state
          WHERE key = 'realtime' AND program_id = $1 AND network = $2`,
@@ -42,11 +38,7 @@ async function loadLastSignature(
 }
 
 async function saveLastSignature(
-    db: DbClient,
-    programId: string,
-    network: string,
-    signature: string,
-    slot: number
+    db: DbClient, programId: string, network: string, signature: string, slot: number
 ): Promise<void> {
     await db.query(
         `INSERT INTO _indexer_state (key, program_id, network, last_signature, last_slot, updated_at)
@@ -59,7 +51,7 @@ async function saveLastSignature(
     );
 }
 
-// ─── Fetch missed signatures ──────────────────────────────────────────────────
+// ─── fetchMissedSignatures ────────────────────────────────────────────────────
 
 async function fetchMissedSignatures(
     rpc: RpcClient,
@@ -68,34 +60,31 @@ async function fetchMissedSignatures(
     logger: Logger
 ): Promise<string[]> {
     const signatures: string[] = [];
-    let before: string | undefined = undefined;
+    let before: string | undefined;
 
     logger.info({ until }, "Backfill: fetching missed signatures...");
 
     while (true) {
         const page = await rpc.getSignaturesForAddress(programId, {
-            limit: SIGNATURES_PER_PAGE,
-            before,
-            until,
+            limit: SIGNATURES_PER_PAGE, before, until,
         });
-
         if (page.length === 0) break;
-        for (const sig of page) signatures.push(sig.signature);
+        for (const s of page) signatures.push(s.signature);
         if (page.length < SIGNATURES_PER_PAGE) break;
         before = page[page.length - 1]?.signature;
     }
 
-    return signatures.reverse();  // oldest first
+    return signatures.reverse();   // chronological order
 }
 
-// ─── Process one transaction ──────────────────────────────────────────────────
+// ─── processTx ───────────────────────────────────────────────────────────────
 
-interface ProcessedTx {
+interface TxResult {
     slot: number;
     ixRecords: { tableName: string; record: InstructionRecord }[];
-    // Writable pubkeys from decoded instructions — candidates for acc_ refresh.
-    // accounts[0] is usually the signer; everything after may be program PDAs.
-    writableAccountPubkeys: string[];
+    // Non-signer writable pubkeys from decoded instructions.
+    // These are the PDAs most likely to have changed state.
+    writablePubkeys: string[];
 }
 
 async function processTx(
@@ -103,7 +92,7 @@ async function processTx(
     rpc: RpcClient,
     decoder: Decoder,
     logger: Logger
-): Promise<ProcessedTx | null> {
+): Promise<TxResult | null> {
     const tx = await rpc.getTransaction(signature);
     if (!tx) {
         logger.warn({ signature }, "Transaction not found — skipping");
@@ -117,31 +106,29 @@ async function processTx(
     const blockTime = tx.blockTime ? new Date(tx.blockTime * 1000) : null;
     const success = tx.meta?.err === null;
 
-    const ixRecords: { tableName: string; record: InstructionRecord }[] = instructions.map((ix) => ({
+    const ixRecords = instructions.map(ix => ({
         tableName: `ix_${toSnake(ix.name)}`,
-        record: { instruction: ix, signature, slot, blockTime, success },
+        record: { instruction: ix, signature, slot, blockTime, success } as InstructionRecord,
     }));
 
-    // Collect non-signer account pubkeys from successful transactions.
-    // These are the program-owned PDAs most likely to have changed state.
-    const writableAccountPubkeys: string[] = [];
+    // Collect candidate pubkeys for per-account refresh.
+    // Skip accounts[0] (typically the fee-payer/signer); everything from
+    // index 1 onward may be a program-owned PDA that changed state.
+    const writablePubkeys: string[] = [];
     if (success) {
         const seen = new Set<string>();
         for (const ix of instructions) {
             for (let i = 1; i < ix.accounts.length; i++) {
                 const pk = ix.accounts[i];
-                if (pk && !seen.has(pk)) {
-                    seen.add(pk);
-                    writableAccountPubkeys.push(pk);
-                }
+                if (pk && !seen.has(pk)) { seen.add(pk); writablePubkeys.push(pk); }
             }
         }
     }
 
-    return { slot, ixRecords, writableAccountPubkeys };
+    return { slot, ixRecords, writablePubkeys };
 }
 
-// ─── Backfill ─────────────────────────────────────────────────────────────────
+// ─── runBackfill ──────────────────────────────────────────────────────────────
 
 async function runBackfill(
     programId: PublicKey,
@@ -167,25 +154,23 @@ async function runBackfill(
 
     for (let i = 0; i < signatures.length; i += TX_BATCH_SIZE) {
         const batch = signatures.slice(i, i + TX_BATCH_SIZE);
-
         const results = await Promise.allSettled(
-            batch.map((sig) => processTx(sig, rpc, decoder, logger))
+            batch.map(sig => processTx(sig, rpc, decoder, logger))
         );
 
         const ixRecords: { tableName: string; record: InstructionRecord }[] = [];
 
         for (let j = 0; j < results.length; j++) {
-            const result = results[j];
-            if (result?.status === "rejected") {
-                logger.warn({ signature: batch[j], err: result.reason }, "Backfill tx failed");
+            const r = results[j];
+            if (r?.status === "rejected") {
+                logger.warn({ signature: batch[j], err: r.reason }, "Backfill tx failed");
                 continue;
             }
-            if (!result?.value) continue;
+            if (!r?.value) continue;
 
-            ixRecords.push(...result.value.ixRecords);
-
-            if (result.value.slot > latestSlot) {
-                latestSlot = result.value.slot;
+            ixRecords.push(...r.value.ixRecords);
+            if (r.value.slot > latestSlot) {
+                latestSlot = r.value.slot;
                 latestSignature = batch[j] ?? null;
             }
             processed++;
@@ -197,7 +182,6 @@ async function runBackfill(
 
         if (latestSignature && processed % STATE_SAVE_EVERY === 0) {
             await saveLastSignature(db, programId.toBase58(), network, latestSignature, latestSlot);
-            logger.debug({ processed, latestSignature }, "Backfill cursor saved");
         }
     }
 
@@ -205,12 +189,12 @@ async function runBackfill(
     return latestSignature;
 }
 
-// ─── WebSocket subscription ───────────────────────────────────────────────────
+// ─── subscribeWithReconnect ───────────────────────────────────────────────────
 
 function subscribeWithReconnect(
     connection: Connection,
     programId: PublicKey,
-    onSignature: (signature: string) => void,
+    onSignature: (sig: string) => void,
     logger: Logger
 ): () => void {
     let subId: number | null = null;
@@ -222,14 +206,14 @@ function subscribeWithReconnect(
         try {
             subId = connection.onLogs(
                 programId,
-                (logs) => { if (!logs.err) onSignature(logs.signature); },
+                logs => { if (!logs.err) onSignature(logs.signature); },
                 "confirmed"
             );
             attempt = 0;
             logger.info({ programId: programId.toBase58() }, "WebSocket subscribed");
         } catch (err) {
             attempt++;
-            const delay = Math.min(WS_RECONNECT_BASE_MS * Math.pow(2, attempt - 1), WS_RECONNECT_MAX_MS);
+            const delay = Math.min(WS_RECONNECT_BASE_MS * 2 ** (attempt - 1), WS_RECONNECT_MAX_MS);
             logger.warn({ err, attempt, delayMs: delay }, "WebSocket connection failed — reconnecting");
             await sleep(delay);
             subscribe();
@@ -238,16 +222,11 @@ function subscribeWithReconnect(
 
     const watchdog = setInterval(async () => {
         if (stopped || subId === null) return;
-        try {
-            await connection.getSlot();
-        } catch {
+        try { await connection.getSlot(); } catch {
             logger.warn("WebSocket watchdog: RPC unreachable — resubscribing");
-            if (subId !== null) {
-                connection.removeOnLogsListener(subId).catch(() => { });
-                subId = null;
-            }
+            if (subId !== null) { connection.removeOnLogsListener(subId).catch(() => { }); subId = null; }
             attempt++;
-            const delay = Math.min(WS_RECONNECT_BASE_MS * Math.pow(2, attempt - 1), WS_RECONNECT_MAX_MS);
+            const delay = Math.min(WS_RECONNECT_BASE_MS * 2 ** (attempt - 1), WS_RECONNECT_MAX_MS);
             await sleep(delay);
             subscribe();
         }
@@ -258,9 +237,7 @@ function subscribeWithReconnect(
     return () => {
         stopped = true;
         clearInterval(watchdog);
-        if (subId !== null) {
-            connection.removeOnLogsListener(subId).catch(() => { });
-        }
+        if (subId !== null) connection.removeOnLogsListener(subId).catch(() => { });
     };
 }
 
@@ -291,20 +268,16 @@ export async function runRealtime(
 
     if (lastSignature) {
         log.info({ lastSignature }, "Cold start: backfilling missed transactions...");
-        const newLatest = await runBackfill(
-            programId, lastSignature, rpc, decoder, db, network, log
-        );
-        if (newLatest) {
-            await saveLastSignature(db, programIdStr, network, newLatest, 0);
-        }
+        const newLatest = await runBackfill(programId, lastSignature, rpc, decoder, db, network, log);
+        if (newLatest) await saveLastSignature(db, programIdStr, network, newLatest, 0);
     } else {
         log.info("Cold start: no previous state — starting fresh");
     }
 
     // ─── Initial account sweep ────────────────────────────────────────────────
-    // Populates acc_ tables with a full snapshot of current on-chain state
-    // before entering the realtime loop. Individual accounts are then refreshed
-    // per-transaction via sweepSingleAccount() as they change.
+    // Populates all acc_ tables once from the current on-chain state.
+    // After this, individual accounts are refreshed per-transaction via
+    // sweepSingleAccount() as they change — avoiding a full re-sweep each time.
 
     if (hasAccountTypes) {
         log.info("Running initial account sweep...");
@@ -327,15 +300,15 @@ export async function runRealtime(
                 const result = await processTx(signature, rpc, decoder, log);
                 if (!result) return;
 
-                // Write instructions first
+                // 1. Persist instructions
                 await writeBatch(db, result.ixRecords, [], log);
 
-                // Then refresh every account that may have changed.
-                // sweepSingleAccount uses getAccountInfo (one call per account)
-                // which is much cheaper than a full getProgramAccounts sweep.
-                if (hasAccountTypes && result.writableAccountPubkeys.length > 0) {
+                // 2. Refresh each account that the transaction may have mutated.
+                //    sweepSingleAccount → getAccountInfo (one call per pubkey),
+                //    far cheaper than a full getProgramAccounts on every tx.
+                if (hasAccountTypes && result.writablePubkeys.length > 0) {
                     await Promise.allSettled(
-                        result.writableAccountPubkeys.map((pk) =>
+                        result.writablePubkeys.map(pk =>
                             sweepSingleAccount(pk, rpc, decoder, idl, db, result.slot, log)
                         )
                     );

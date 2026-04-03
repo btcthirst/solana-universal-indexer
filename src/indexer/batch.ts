@@ -20,7 +20,7 @@ function toSnake(name: string): string {
     return name.replace(/([A-Z])/g, "_$1").toLowerCase().replace(/^_/, "");
 }
 
-// ─── Fetch signatures by slot range ──────────────────────────────────────────
+// ─── fetchSignaturesBySlotRange ───────────────────────────────────────────────
 
 async function fetchSignaturesBySlotRange(
     rpc: RpcClient,
@@ -30,26 +30,17 @@ async function fetchSignaturesBySlotRange(
     logger: Logger
 ): Promise<string[]> {
     const signatures: string[] = [];
-    let before: string | undefined = undefined;
+    let before: string | undefined;
 
     logger.info({ startSlot, endSlot }, "Fetching signatures for slot range...");
 
     while (true) {
-        const page = await rpc.getSignaturesForAddress(programId, {
-            limit: SIGNATURES_PER_PAGE,
-            before,
-        });
-
+        const page = await rpc.getSignaturesForAddress(programId, { limit: SIGNATURES_PER_PAGE, before });
         if (page.length === 0) break;
 
         for (const sig of page) {
-            if (sig.slot < startSlot) {
-                logger.debug({ slot: sig.slot, startSlot }, "Reached startSlot boundary — stopping");
-                return signatures;
-            }
-            if (sig.slot <= endSlot) {
-                signatures.push(sig.signature);
-            }
+            if (sig.slot < startSlot) return signatures;   // RPC returns newest→oldest
+            if (sig.slot <= endSlot) signatures.push(sig.signature);
         }
 
         if (page.length < SIGNATURES_PER_PAGE) break;
@@ -59,38 +50,33 @@ async function fetchSignaturesBySlotRange(
     return signatures;
 }
 
-// ─── Process one transaction ──────────────────────────────────────────────────
+// ─── processTx ───────────────────────────────────────────────────────────────
 
 async function processTx(
     signature: string,
     rpc: RpcClient,
     decoder: Decoder,
-    idl: ParsedIdl,
-    db: DbClient,
     logger: Logger
-): Promise<void> {
+): Promise<{ ixRecords: { tableName: string; record: InstructionRecord }[] } | null> {
     const tx = await rpc.getTransaction(signature);
     if (!tx) {
         logger.warn({ signature }, "Transaction not found — skipping");
-        return;
+        return null;
     }
 
     const instructions = decoder.extractInstructions(tx);
-    if (instructions.length === 0) return;
+    if (instructions.length === 0) return null;
 
     const slot = tx.slot;
     const blockTime = tx.blockTime ? new Date(tx.blockTime * 1000) : null;
     const success = tx.meta?.err === null;
 
-    const ixRecords: { tableName: string; record: InstructionRecord }[] = instructions.map((ix) => ({
+    const ixRecords = instructions.map((ix) => ({
         tableName: `ix_${toSnake(ix.name)}`,
-        record: { instruction: ix, signature, slot, blockTime, success },
+        record: { instruction: ix, signature, slot, blockTime, success } as InstructionRecord,
     }));
 
-    // Accounts are NOT decoded inline here because getParsedTransaction does
-    // not return raw account bytes. sweepAccounts() handles acc_ tables after
-    // all transactions finish — see the end of runBatch().
-    await writeBatch(db, ixRecords, [], logger);
+    return { ixRecords };
 }
 
 // ─── runBatch ─────────────────────────────────────────────────────────────────
@@ -100,7 +86,7 @@ export interface BatchOptions {
     startSlot?: number;
     endSlot?: number;
     signatures?: string[];
-    skipAccountSweep?: boolean;   // useful in tests or CI environments without RPC
+    skipAccountSweep?: boolean;   // set true in unit tests or offline environments
 }
 
 export async function runBatch(
@@ -113,7 +99,7 @@ export async function runBatch(
 ): Promise<void> {
     const log = logger.child({ module: "batch-indexer" });
 
-    // ─── Collect signatures ───────────────────────────────────────────────────
+    // ─── 1. Collect signatures ────────────────────────────────────────────────
 
     let signatures: string[];
 
@@ -129,7 +115,7 @@ export async function runBatch(
         throw new Error("runBatch: provide either signatures or startSlot + endSlot");
     }
 
-    // ─── Process transactions ─────────────────────────────────────────────────
+    // ─── 2. Process transactions ──────────────────────────────────────────────
 
     if (signatures.length === 0) {
         log.info("No signatures to process");
@@ -140,22 +126,27 @@ export async function runBatch(
 
         for (let i = 0; i < total; i += TX_BATCH_SIZE) {
             const batch = signatures.slice(i, i + TX_BATCH_SIZE);
-
             const results = await Promise.allSettled(
-                batch.map((sig) => processTx(sig, rpc, decoder, idl, db, log))
+                batch.map(sig => processTx(sig, rpc, decoder, log))
             );
 
+            const ixRecords: { tableName: string; record: InstructionRecord }[] = [];
+
             for (let j = 0; j < results.length; j++) {
-                const result = results[j];
-                if (result?.status === "rejected") {
+                const r = results[j];
+                if (r?.status === "rejected") {
                     failed++;
-                    log.warn(
-                        { signature: batch[j], err: result.reason },
-                        "Failed to process transaction — skipping"
-                    );
-                } else {
+                    log.warn({ signature: batch[j], err: r.reason }, "Failed to process tx — skipping");
+                } else if (r?.value) {
+                    ixRecords.push(...r.value.ixRecords);
                     processed++;
+                } else {
+                    processed++;   // tx had no matching instructions — still counts
                 }
+            }
+
+            if (ixRecords.length > 0) {
+                await writeBatch(db, ixRecords, [], log);
             }
 
             if (processed % PROGRESS_EVERY === 0 || i + TX_BATCH_SIZE >= total) {
@@ -167,9 +158,13 @@ export async function runBatch(
         log.info({ processed, failed, total }, "Transaction batch complete");
     }
 
-    // ─── Account sweep ────────────────────────────────────────────────────────
-    // Runs after all transactions so acc_ tables reflect the final on-chain state.
-    // getParsedTransaction cannot provide raw account bytes; getProgramAccounts can.
+    // ─── 3. Account sweep ─────────────────────────────────────────────────────
+    // Runs AFTER all transactions so acc_ tables reflect the final on-chain state.
+    //
+    // Why here and not inline in processTx?
+    // getParsedTransaction does not return raw account bytes; only
+    // getProgramAccounts does.  Running one sweep at the end is also more
+    // efficient than one call per transaction.
 
     if (opts.skipAccountSweep) {
         log.info("Account sweep skipped (skipAccountSweep=true)");

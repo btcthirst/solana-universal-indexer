@@ -13,11 +13,11 @@ export interface InstructionRecord {
 }
 
 export interface AccountRecord {
-    accountName: string;        // IDL account type name, e.g. "Offer"
-    pubkey: string;
+    accountName: string;                  // IDL type name, e.g. "Offer"
+    pubkey: string;                       // base58
     slot: number;
     lamports: number | null;
-    data: Record<string, unknown>;   // decoded fields from BorshAccountsCoder
+    data: Record<string, unknown>;        // decoded fields from BorshAccountsCoder
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -29,7 +29,9 @@ function toSnake(name: string): string {
         .replace(/^_/, "");
 }
 
-// Recursive serialization — BigInt → string, others passthrough for JSONB fields
+// Recursively serialises values that pg cannot handle natively:
+// BigInt → decimal string, PublicKey → base58, Buffer → hex.
+// Nested objects (JSONB columns) are walked recursively.
 function safeSerialize(value: unknown): unknown {
     if (typeof value === "bigint") return value.toString();
     if (value === null || value === undefined) return value;
@@ -56,33 +58,37 @@ export async function writeInstruction(
     const { instruction, signature, slot, blockTime, success } = record;
 
     const baseColumns = ["signature", "slot", "block_time", "success", "caller"];
-    const baseValues: unknown[] = [signature, slot, blockTime, success, instruction.accounts[0] ?? null];
+    const baseValues: unknown[] = [
+        signature, slot, blockTime, success,
+        instruction.accounts[0] ?? null,
+    ];
 
-    const argColumns = Object.keys(instruction.args).map(
-        (k) => `arg_${toSnake(k)}`
-    );
+    const argColumns = Object.keys(instruction.args).map(k => `arg_${toSnake(k)}`);
     const argValues = Object.values(instruction.args).map(safeSerialize);
 
     const columns = [...baseColumns, ...argColumns];
     const values = [...baseValues, ...argValues];
+    const ph = values.map((_, i) => `$${i + 1}`).join(", ");
 
-    const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
+    await db.query(
+        `INSERT INTO ${tableName} (${columns.join(", ")})
+         VALUES (${ph})
+         ON CONFLICT (signature) DO NOTHING`,
+        values
+    );
 
-    const sql = `
-        INSERT INTO ${tableName} (${columns.join(", ")})
-        VALUES (${placeholders})
-        ON CONFLICT (signature) DO NOTHING
-    `;
-
-    await db.query(sql, values);
     logger.debug({ tableName, signature }, "Instruction written");
 }
 
 // ─── writeAccount ─────────────────────────────────────────────────────────────
-// Upserts one decoded account into its acc_<type> table.
-// The UPSERT condition "WHERE table.slot <= EXCLUDED.slot" means:
-//   overwrite only when the incoming data is from an equal-or-newer slot,
-//   i.e. keep the latest known state and never regress to older data.
+// Upserts one decoded account row.
+//
+// UPSERT semantics:
+//   ON CONFLICT (pubkey) DO UPDATE … WHERE <table>.slot <= EXCLUDED.slot
+//
+// Meaning: overwrite the existing row only when the incoming data comes from
+// the same slot or a *newer* one.  This prevents a stale full-sweep from
+// rolling back a more recent per-transaction realtime update.
 
 export async function writeAccount(
     db: DbClient,
@@ -92,42 +98,40 @@ export async function writeAccount(
 ): Promise<void> {
     const { pubkey, slot, lamports, data } = record;
 
-    const baseColumns = ["pubkey", "slot", "lamports"];
-    const baseValues: unknown[] = [pubkey, slot, lamports];
-
-    // data keys come from BorshAccountsCoder — already snake_case for IDLs
-    // that use snake_case field names. toSnake() is safe to call twice.
-    const dataColumns = Object.keys(data).map((k) => toSnake(k));
+    // BorshAccountsCoder returns snake_case keys for IDLs whose field names
+    // are already snake_case (confirmed by live test against Anchor v0.32).
+    // toSnake() is idempotent so it's safe to apply regardless.
+    const dataColumns = Object.keys(data).map(k => toSnake(k));
     const dataValues = Object.values(data).map(safeSerialize);
 
-    const columns = [...baseColumns, ...dataColumns];
-    const values = [...baseValues, ...dataValues];
+    const columns = ["pubkey", "slot", "lamports", ...dataColumns];
+    const values = [pubkey, slot, lamports, ...dataValues];
+    const ph = values.map((_, i) => `$${i + 1}`).join(", ");
 
-    const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
-
-    // Build the SET list for every column except pubkey (the PK).
     const updateSet = [
-        "slot = EXCLUDED.slot",
+        "slot     = EXCLUDED.slot",
         "lamports = EXCLUDED.lamports",
-        ...dataColumns.map((c) => `${c} = EXCLUDED.${c}`),
+        ...dataColumns.map(c => `${c} = EXCLUDED.${c}`),
     ].join(", ");
 
-    // Only overwrite when the new data is from the same or a later slot.
-    // This prevents a stale sweep from reverting a more recent realtime update.
-    const sql = `
-        INSERT INTO ${tableName} (${columns.join(", ")})
-        VALUES (${placeholders})
-        ON CONFLICT (pubkey) DO UPDATE
-            SET ${updateSet}
-            WHERE ${tableName}.slot <= EXCLUDED.slot
-    `;
+    await db.query(
+        `INSERT INTO ${tableName} (${columns.join(", ")})
+         VALUES (${ph})
+         ON CONFLICT (pubkey) DO UPDATE
+             SET ${updateSet}
+             WHERE ${tableName}.slot <= EXCLUDED.slot`,
+        values
+    );
 
-    await db.query(sql, values);
     logger.debug({ tableName, pubkey }, "Account written");
 }
 
 // ─── writeBatch ───────────────────────────────────────────────────────────────
-// Writes a mixed batch of instruction and account records inside one transaction.
+// Writes a mixed batch of instructions and (optionally) accounts inside a
+// single database transaction.  The accounts slice is usually empty here
+// because account state is populated by sweepAccounts / sweepSingleAccount,
+// which call writeAccount directly.  The parameter is kept so callers that
+// do have pre-decoded account records can flush them in the same round-trip.
 
 export async function writeBatch(
     db: DbClient,
@@ -136,7 +140,8 @@ export async function writeBatch(
     logger: Logger
 ): Promise<void> {
     await db.transaction(async (client) => {
-        // ── Instructions ──────────────────────────────────────────────────────
+
+        // ── Instructions ─────────────────────────────────────────────────────
         for (const { tableName, record } of instructions) {
             const { instruction, signature, slot, blockTime, success } = record;
 
@@ -146,46 +151,41 @@ export async function writeBatch(
                 instruction.accounts[0] ?? null,
             ];
 
-            const argColumns = Object.keys(instruction.args).map(
-                (k) => `arg_${toSnake(k)}`
-            );
+            const argColumns = Object.keys(instruction.args).map(k => `arg_${toSnake(k)}`);
             const argValues = Object.values(instruction.args).map(safeSerialize);
 
             const columns = [...baseColumns, ...argColumns];
             const values = [...baseValues, ...argValues];
-            const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
+            const ph = values.map((_, i) => `$${i + 1}`).join(", ");
 
             await client.query(
                 `INSERT INTO ${tableName} (${columns.join(", ")})
-                 VALUES (${placeholders})
+                 VALUES (${ph})
                  ON CONFLICT (signature) DO NOTHING`,
                 values
             );
         }
 
-        // ── Accounts ──────────────────────────────────────────────────────────
+        // ── Accounts ─────────────────────────────────────────────────────────
         for (const { tableName, record } of accounts) {
             const { pubkey, slot, lamports, data } = record;
 
-            const baseColumns = ["pubkey", "slot", "lamports"];
-            const baseValues: unknown[] = [pubkey, slot, lamports];
-
-            const dataColumns = Object.keys(data).map((k) => toSnake(k));
+            const dataColumns = Object.keys(data).map(k => toSnake(k));
             const dataValues = Object.values(data).map(safeSerialize);
 
-            const columns = [...baseColumns, ...dataColumns];
-            const values = [...baseValues, ...dataValues];
-            const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
+            const columns = ["pubkey", "slot", "lamports", ...dataColumns];
+            const values = [pubkey, slot, lamports, ...dataValues];
+            const ph = values.map((_, i) => `$${i + 1}`).join(", ");
 
             const updateSet = [
-                "slot = EXCLUDED.slot",
+                "slot     = EXCLUDED.slot",
                 "lamports = EXCLUDED.lamports",
-                ...dataColumns.map((c) => `${c} = EXCLUDED.${c}`),
+                ...dataColumns.map(c => `${c} = EXCLUDED.${c}`),
             ].join(", ");
 
             await client.query(
                 `INSERT INTO ${tableName} (${columns.join(", ")})
-                 VALUES (${placeholders})
+                 VALUES (${ph})
                  ON CONFLICT (pubkey) DO UPDATE
                      SET ${updateSet}
                      WHERE ${tableName}.slot <= EXCLUDED.slot`,
