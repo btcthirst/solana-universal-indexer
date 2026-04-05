@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { Logger } from "pino";
+import type { DbClient } from "../../src/db/client";
+import type { Decoder } from "../../src/indexer/decoder";
+import type { RpcClient } from "../../src/utils/rpc";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 // Discriminator values confirmed against live BorshAccountsCoder.decode() test.
@@ -39,35 +43,35 @@ function makeIdl(hasAccounts = true) {
     };
 }
 
-function makeLogger() {
+function makeLogger(): Logger {
     const l = {
         info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(),
         child: vi.fn(),
     };
     l.child.mockReturnValue(l);
-    return l as never;
+    return l as unknown as Logger;
 }
 
-function makeDecoder(overrides: Record<string, unknown> = {}) {
+function makeDecoder(overrides: Record<string, unknown> = {}): Decoder {
     return {
         identifyAccountType: vi.fn().mockReturnValue("Offer"),
         decodeAccount: vi.fn().mockReturnValue({ ...DECODED_OFFER }),
         decodeInstruction: vi.fn().mockReturnValue(null),
         extractInstructions: vi.fn().mockReturnValue([]),
         ...overrides,
-    } as never;
+    } as unknown as Decoder;
 }
 
-function makeDb() {
+function makeDb(): DbClient {
     return {
         query: vi.fn().mockResolvedValue({ rows: [] }),
         transaction: vi.fn().mockImplementation(
             async (fn: (c: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) =>
                 fn({ query: vi.fn().mockResolvedValue({ rows: [] }) })
         ),
-        pool: { end: vi.fn() },
+        pool: { end: vi.fn() } as never,
         checkDbConnection: vi.fn(),
-    } as never;
+    } as unknown as DbClient;
 }
 
 function makePk(s: string) { return { toBase58: () => s }; }
@@ -76,14 +80,14 @@ function makeRpc(
     accounts: Array<{ pubkey: { toBase58(): string }; account: { data: unknown; lamports: number } }> = [],
     slot = 300,
     accountInfoData: { data: unknown; lamports: number } | null = null
-) {
+): RpcClient {
     return {
         getProgramAccounts: vi.fn().mockResolvedValue(accounts),
         getSlot: vi.fn().mockResolvedValue(slot),
         connection: {
             getAccountInfo: vi.fn().mockResolvedValue(accountInfoData),
         },
-    } as never;
+    } as unknown as RpcClient;
 }
 
 // ─── sweepAccounts ────────────────────────────────────────────────────────────
@@ -218,10 +222,11 @@ describe("sweepAccounts", () => {
         ];
         const db = makeDb();
         let insertCalls = 0;
-        db.query = vi.fn().mockImplementation(async (sql: string) => {
-            if (sql.includes("INSERT") && ++insertCalls === 1) throw new Error("constraint");
-            return { rows: [] };
-        });
+        (db as unknown as Record<string, unknown>).query =
+            vi.fn().mockImplementation(async (sql: string) => {
+                if (sql.includes("INSERT") && ++insertCalls === 1) throw new Error("constraint");
+                return { rows: [] };
+            });
 
         await expect(
             sweepAccounts(makePk(PROGRAM_ID) as never, makeRpc(accounts), makeDecoder(), makeIdl(), db, makeLogger())
@@ -235,7 +240,7 @@ describe("sweepAccounts", () => {
             getProgramAccounts: vi.fn().mockRejectedValue(new Error("RPC 429")),
             getSlot: vi.fn(),
             connection: { getAccountInfo: vi.fn() },
-        } as never;
+        } as unknown as RpcClient;
         const logger = makeLogger();
 
         await expect(
@@ -254,7 +259,7 @@ describe("sweepAccounts", () => {
             getProgramAccounts: vi.fn().mockResolvedValue(accounts),
             getSlot: vi.fn().mockRejectedValue(new Error("timeout")),
             connection: { getAccountInfo: vi.fn() },
-        } as never;
+        } as unknown as RpcClient;
         const logger = makeLogger();
         const db = makeDb();
 
@@ -330,7 +335,7 @@ describe("sweepSingleAccount", () => {
             getProgramAccounts: vi.fn(),
             getSlot: vi.fn(),
             connection: { getAccountInfo: vi.fn().mockRejectedValue(new Error("net error")) },
-        } as never;
+        } as unknown as RpcClient;
         const logger = makeLogger();
 
         expect(await sweepSingleAccount(PROGRAM_ID, rpc, makeDecoder(), makeIdl(), makeDb(), 100, logger)).toBe(false);
@@ -344,7 +349,8 @@ describe("sweepSingleAccount", () => {
         const { sweepSingleAccount } = await import("../../src/indexer/account-sweeper");
         const rpc = makeRpc([], 0, { data: OFFER_DATA, lamports: 0 });
         const db = makeDb();
-        db.query = vi.fn().mockRejectedValue(new Error("unique_violation"));
+        (db as unknown as Record<string, unknown>).query =
+            vi.fn().mockRejectedValue(new Error("unique_violation"));
         const logger = makeLogger();
 
         expect(await sweepSingleAccount(PROGRAM_ID, rpc, makeDecoder(), makeIdl(), db, 100, logger)).toBe(false);

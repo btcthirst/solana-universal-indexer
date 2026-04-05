@@ -15,7 +15,7 @@ RESET := \033[0m
         install \
         dev build clean \
         lint format typecheck \
-        test test-watch \
+        test test-watch test-coverage test-coverage-ui test-coverage-check \
         db-up db-down db-reset db-shell \
         docker-build docker-up docker-down docker-logs docker-restart \
         env-check
@@ -79,6 +79,15 @@ typecheck:
 # ─── Tests ────────────────────────────────────────────────────────────────────
 test:
 	npx vitest run
+
+test-coverage:
+	npx vitest run --coverage
+
+test-coverage-ui:
+	npx vitest run --coverage --reporter=html && open coverage/index.html
+
+test-coverage-check:
+	npx vitest run --coverage --coverage.thresholds.autoUpdate=false
 
 test-watch:
 	npx vitest

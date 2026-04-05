@@ -46,17 +46,35 @@ const topCallersSchema = z.object({
 });
 
 // ─── Route builder ────────────────────────────────────────────────────────────
+//
+// heavyMax and heavyWindow are forwarded from the rate-limit config in server.ts
+// and applied to endpoints that run expensive aggregation queries. This keeps
+// the rate-limit values in one place (env vars → server.ts) and avoids
+// duplicating magic numbers here.
 
 export async function registerRoutes(
     app: FastifyInstance,
     db: DbClient,
-    idl: ParsedIdl
+    idl: ParsedIdl,
+    heavyMax = 50,
+    heavyWindow = 60_000
 ): Promise<void> {
 
     const instructionNames = idl.instructions.map(i => i.name);
     const accountTypes = idl.accounts.map(a => a.name);
 
-    // ─── GET / — self-documenting ───────────────────────────────────────────────
+    // Shared route option for heavy aggregation endpoints.
+    // @fastify/rate-limit reads config.rateLimit per-route.
+    const heavyRateLimit = {
+        config: {
+            rateLimit: {
+                max: heavyMax,
+                timeWindow: heavyWindow,
+            },
+        },
+    };
+
+    // ─── GET / — self-documenting ─────────────────────────────────────────────
 
     app.get("/", async () => ({
         program: idl.name,
@@ -69,15 +87,15 @@ export async function registerRoutes(
             { method: "GET", path: "/accounts/:type", description: "List accounts of type", params: "pubkey, limit, offset" },
             { method: "GET", path: "/accounts/:type/:pubkey", description: "Single account state" },
             { method: "GET", path: "/stats/instructions", description: "Aggregated stats per instruction" },
-            { method: "GET", path: "/stats/instructions/:name/timeseries", description: "Calls over time", params: "from, to, interval (hour|day|week)" },
-            { method: "GET", path: "/stats/instructions/:name/top-callers", description: "Top caller addresses", params: "limit" },
-            { method: "GET", path: "/stats/program", description: "Overall program statistics" },
+            { method: "GET", path: "/stats/instructions/:name/timeseries", description: "Calls over time", params: "from, to, interval (hour|day|week)", rateLimit: `${heavyMax}/min` },
+            { method: "GET", path: "/stats/instructions/:name/top-callers", description: "Top caller addresses", params: "limit", rateLimit: `${heavyMax}/min` },
+            { method: "GET", path: "/stats/program", description: "Overall program statistics", rateLimit: `${heavyMax}/min` },
         ],
         indexedInstructions: instructionNames,
         indexedAccountTypes: accountTypes,
     }));
 
-    // ─── GET /instructions/:name ────────────────────────────────────────────────
+    // ─── GET /instructions/:name ──────────────────────────────────────────────
 
     app.get("/instructions/:name", async (req: FastifyRequest, reply: FastifyReply) => {
         const { name } = req.params as { name: string };
@@ -117,7 +135,7 @@ export async function registerRoutes(
         };
     });
 
-    // ─── GET /instructions/:name/:signature ─────────────────────────────────────
+    // ─── GET /instructions/:name/:signature ───────────────────────────────────
 
     app.get("/instructions/:name/:signature", async (req: FastifyRequest, reply: FastifyReply) => {
         const { name, signature } = req.params as { name: string; signature: string };
@@ -139,7 +157,7 @@ export async function registerRoutes(
         return rows[0];
     });
 
-    // ─── GET /accounts/:type ────────────────────────────────────────────────────
+    // ─── GET /accounts/:type ──────────────────────────────────────────────────
 
     app.get("/accounts/:type", async (req: FastifyRequest, reply: FastifyReply) => {
         const { type } = req.params as { type: string };
@@ -181,7 +199,7 @@ export async function registerRoutes(
         };
     });
 
-    // ─── GET /accounts/:type/:pubkey ────────────────────────────────────────────
+    // ─── GET /accounts/:type/:pubkey ──────────────────────────────────────────
 
     app.get("/accounts/:type/:pubkey", async (req: FastifyRequest, reply: FastifyReply) => {
         const { type, pubkey } = req.params as { type: string; pubkey: string };
@@ -203,7 +221,7 @@ export async function registerRoutes(
         return rows[0];
     });
 
-    // ─── GET /stats/instructions ────────────────────────────────────────────────
+    // ─── GET /stats/instructions ──────────────────────────────────────────────
 
     app.get("/stats/instructions", async () => {
         const stats: Record<string, unknown> = {};
@@ -238,9 +256,10 @@ export async function registerRoutes(
         return stats;
     });
 
-    // ─── GET /stats/instructions/:name/timeseries ────────────────────────────────
+    // ─── GET /stats/instructions/:name/timeseries ─────────────────────────────
+    // Heavy endpoint — tighter rate limit applied via heavyRateLimit.
 
-    app.get("/stats/instructions/:name/timeseries", async (req: FastifyRequest, reply: FastifyReply) => {
+    app.get("/stats/instructions/:name/timeseries", heavyRateLimit, async (req: FastifyRequest, reply: FastifyReply) => {
         const { name } = req.params as { name: string };
         const table = `ix_${toSnake(name)}`;
 
@@ -281,20 +300,16 @@ export async function registerRoutes(
         }));
     });
 
-    // ─── GET /stats/instructions/:name/top-callers ──────────────────────────────
-    // The first account in the ix_ table is usually the caller (signer)
+    // ─── GET /stats/instructions/:name/top-callers ────────────────────────────
+    // Heavy endpoint — tighter rate limit applied via heavyRateLimit.
 
-    app.get("/stats/instructions/:name/top-callers", async (req: FastifyRequest, reply: FastifyReply) => {
+    app.get("/stats/instructions/:name/top-callers", heavyRateLimit, async (req: FastifyRequest, reply: FastifyReply) => {
         const { name } = req.params as { name: string };
         const table = `ix_${toSnake(name)}`;
 
         const query = validateQuery(topCallersSchema, req.query, reply);
         if (!query) return;
 
-        // Check if there is an accounts column or take the first argument
-        // In our tables accounts are not stored separately — caller is taken from accounts[0]
-        // This endpoint requires the decoder to store the caller as a separate column.
-        // For now, return top signatures as a proxy for top callers.
         const { rows } = await db.query<{ caller: string; count: string }>(
             `SELECT caller, COUNT(*) AS count
        FROM ${table}
@@ -311,10 +326,10 @@ export async function registerRoutes(
         }));
     });
 
-    // ─── GET /stats/program ─────────────────────────────────────────────────────
+    // ─── GET /stats/program ───────────────────────────────────────────────────
+    // Heavy endpoint — tighter rate limit applied via heavyRateLimit.
 
-    app.get("/stats/program", async () => {
-        // Total number of transactions across all ix_ tables
+    app.get("/stats/program", heavyRateLimit, async () => {
         const txCounts = await Promise.all(
             instructionNames.map(name =>
                 db.query<{ count: string; first: string | null; last: string | null }>(
@@ -331,7 +346,6 @@ export async function registerRoutes(
         const allFirstDates = txCounts.map(r => r.rows[0]?.first).filter(Boolean) as string[];
         const allLastDates = txCounts.map(r => r.rows[0]?.last).filter(Boolean) as string[];
 
-        // Unique pubkeys across all acc_ tables
         const accCounts = await Promise.all(
             accountTypes.map(type =>
                 db.query<{ count: string }>(
